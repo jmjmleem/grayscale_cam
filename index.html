@@ -70,19 +70,16 @@
     }
   ];
 
-  // ===== 인식 튜닝 파라미터 =====
+  // ===== 인식 튜닝 =====
   const SCAN_INTERVAL_MS = 120;
-
-  // mismatch 허용치: (환경 따라) 14~22 범위에서 조절
   const MAX_MISMATCH = 18;
 
-  // ROI 후보(중앙 + 주변)
   const OFFSETS = [0, 0.06, -0.06, 0.12, -0.12, 0.18, -0.18];
+  const SCALES  = [0.50, 0.58, 0.65, 0.80, 0.95];
 
-  // 스케일 후보(코드가 화면에서 작을 때 대비)
-  const SCALES = [0.50, 0.58, 0.65, 0.80, 0.95];
+  // “정사각형이 아닌 화면 왜곡” 대응 종횡비 후보
+  const ASPECTS = [0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.30];
 
-  // ===== 고정 임계값 (사용자 지정) =====
   // 0: <=100, 1: 101..150, 2: 151..200, 3: >=201
   function quantize(gray) {
     if (gray <= 100) return 0;
@@ -98,7 +95,7 @@
     return out;
   }
 
-  // 각 패턴에 대해 0/90/180/270 회전 버전 미리 생성
+  // 패턴별 0/90/180/270 회전 버전
   const ROT_PATTERNS = PATTERNS.map(p => ({
     id: p.id,
     url: p.url,
@@ -114,11 +111,12 @@
   const video = document.getElementById("video");
   const canvas = document.getElementById("canvas");
   const btnStart = document.getElementById("start");
-  const btnStop = document.getElementById("stop");
+  const btnStop  = document.getElementById("stop");
 
   let stream = null;
   let timer = null;
   let opened = false;
+  let okStreak = 0;
 
   function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -126,23 +124,27 @@
     return Math.round(0.299*r + 0.587*g + 0.114*b);
   }
 
-  // ROI를 100x100으로 캡처
-  function captureROITo100(cx, cy, side) {
+  // (추가 권장) iOS에서 비디오가 늘어나는 케이스 완화
+  // CSS에 넣어도 되지만, 여기서도 안전하게 설정
+  video.style.objectFit = "cover";
+
+  // ROI를 100x100으로 캡처 (직사각형 ROI 허용)
+  function captureROITo100(cx, cy, sw, sh) {
     const w = video.videoWidth;
     const h = video.videoHeight;
     if (!w || !h) return null;
 
-    const x0 = Math.max(0, Math.min(w - side, Math.floor(cx - side/2)));
-    const y0 = Math.max(0, Math.min(h - side, Math.floor(cy - side/2)));
+    const x0 = Math.max(0, Math.min(w - sw, Math.floor(cx - sw / 2)));
+    const y0 = Math.max(0, Math.min(h - sh, Math.floor(cy - sh / 2)));
 
     canvas.width = 100;
     canvas.height = 100;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(video, x0, y0, side, side, 0, 0, 100, 100);
+    ctx.drawImage(video, x0, y0, sw, sh, 0, 0, 100, 100);
     return ctx.getImageData(0, 0, 100, 100);
   }
 
-  // 셀 내부 트림 평균(노이즈/블러/모아레 대응)
+  // 셀 트림 평균
   function cellTrimmedMean(imageData, r0, c0, cellSize) {
     const { data } = imageData;
     const vals = [];
@@ -182,21 +184,18 @@
     return m;
   }
 
-  // 너무 단색(배경)인 ROI는 제외 → 오검출 감소
+  // 오검출 방지용 간단 필터
   function passesHistogramFilter(hist) {
     const total = hist[0]+hist[1]+hist[2]+hist[3];
     if (total !== 100) return false;
-
     const maxBin = Math.max(...hist);
-    if (maxBin >= 92) return false; // 거의 단색
-
+    if (maxBin >= 92) return false;
     const nonZeroBins = hist.filter(x => x > 0).length;
     if (nonZeroBins < 2) return false;
-
     return true;
   }
 
-  // 한 프레임에서 가장 잘 맞는 (패턴, mismatch) 찾기
+  // 한 프레임에서 “가장 잘 맞는 패턴” 찾기
   function scanFrameOnce() {
     const w = video.videoWidth, h = video.videoHeight;
     if (!w || !h) return { best: 999, ok:false, bestId:null, bestUrl:null };
@@ -212,38 +211,41 @@
     for (const scale of SCALES) {
       const side = Math.floor(baseSide * scale);
 
-      for (const oy of OFFSETS) {
-        for (const ox of OFFSETS) {
-          const cx = centerX + ox * baseSide;
-          const cy = centerY + oy * baseSide;
+      for (const aspect of ASPECTS) {
+        const sw = Math.floor(side * aspect);
+        const sh = Math.floor(side / aspect);
 
-          const imgData = captureROITo100(cx, cy, side);
-          if (!imgData) continue;
+        for (const oy of OFFSETS) {
+          for (const ox of OFFSETS) {
+            const cx = centerX + ox * baseSide;
+            const cy = centerY + oy * baseSide;
 
-          const { levels, hist } = extractLevels(imgData);
-          if (!passesHistogramFilter(hist)) continue;
+            const imgData = captureROITo100(cx, cy, sw, sh);
+            if (!imgData) continue;
 
-          for (const p of ROT_PATTERNS) {
-            for (const t of p.rots) {
-              const mm = mismatchCount(levels, t);
-              if (mm < bestMismatch) {
-                bestMismatch = mm;
-                bestId = p.id;
-                bestUrl = p.url;
-              }
-              if (bestMismatch <= MAX_MISMATCH) {
-                return { best: bestMismatch, ok:true, bestId, bestUrl };
+            const { levels, hist } = extractLevels(imgData);
+            if (!passesHistogramFilter(hist)) continue;
+
+            for (const p of ROT_PATTERNS) {
+              for (const t of p.rots) {
+                const mm = mismatchCount(levels, t);
+                if (mm < bestMismatch) {
+                  bestMismatch = mm;
+                  bestId = p.id;
+                  bestUrl = p.url;
+                }
+                if (bestMismatch <= MAX_MISMATCH) {
+                  return { best: bestMismatch, ok:true, bestId, bestUrl };
+                }
               }
             }
           }
         }
       }
     }
+
     return { best: bestMismatch, ok: bestMismatch <= MAX_MISMATCH, bestId, bestUrl };
   }
-
-  // 연속으로 2프레임 이상 성공하면 이동
-  let okStreak = 0;
 
   function loop() {
     if (opened) return;
