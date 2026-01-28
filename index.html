@@ -34,7 +34,7 @@
 (() => {
   const N = 10;
 
-  // ===== 2개 패턴 → 2개 URL 매핑 =====
+  // ===== 2개 패턴 → 2개 URL 매핑 (levels: 0..3) =====
   const PATTERNS = [
     {
       id: "NPL_HOME",
@@ -70,48 +70,61 @@
     }
   ];
 
-  // ===== 인식 튜닝 =====
+  // ===== 튜닝 =====
   const SCAN_INTERVAL_MS = 120;
-  const MAX_MISMATCH = 18;
 
+  // “얼마나 비슷하면 인식할지” (작을수록 엄격)
+  // 처음은 28 추천. 잘 안 잡히면 32~38까지 올려도 됨.
+  const RMSE_THRESHOLD = 30;
+
+  // ROI 후보(중앙 + 주변)
   const OFFSETS = [0, 0.06, -0.06, 0.12, -0.12, 0.18, -0.18];
-  const SCALES  = [0.50, 0.58, 0.65, 0.80, 0.95];
 
-  // “정사각형이 아닌 화면 왜곡” 대응 종횡비 후보
-  const ASPECTS = [0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.30];
+  // 스케일 후보(코드가 화면에서 작을 때 대비)
+  const SCALES  = [0.45, 0.50, 0.58, 0.65, 0.80, 0.95];
 
-  // 0: <=100, 1: 101..150, 2: 151..200, 3: >=201
-  function quantize(gray) {
-    if (gray <= 100) return 0;
-    if (gray <= 150) return 1;
-    if (gray <= 200) return 2;
-    return 3;
-  }
+  // 화면에서 코드가 직사각형처럼 보이는 왜곡 대응
+  const ASPECTS = [0.70, 0.80, 0.90, 1.0, 1.10, 1.25, 1.45];
 
-  // ===== 회전 지원 =====
+  // level -> 대표 회색값(템플릿)
+  // 네 이미지가 0/85/170/255라면 이게 가장 안정적
+  const LEVEL_TO_GRAY = [0, 85, 170, 255];
+
+  // ===== 회전 =====
   function rotate90(m) {
     const out = Array.from({length:N}, () => Array(N).fill(0));
     for (let r=0;r<N;r++) for (let c=0;c<N;c++) out[c][N-1-r] = m[r][c];
     return out;
   }
 
-  // 패턴별 0/90/180/270 회전 버전
-  const ROT_PATTERNS = PATTERNS.map(p => ({
-    id: p.id,
-    url: p.url,
-    rots: [
-      p.levels,
-      rotate90(p.levels),
-      rotate90(rotate90(p.levels)),
-      rotate90(rotate90(rotate90(p.levels))),
-    ]
-  }));
+  // 패턴별 회전 + “템플릿(0..255)” 배열로 변환해 미리 저장
+  function levelsToTargetVec(levels2d) {
+    const v = new Float32Array(N*N);
+    let k = 0;
+    for (let r=0;r<N;r++) for (let c=0;c<N;c++) v[k++] = LEVEL_TO_GRAY[levels2d[r][c]];
+    return v;
+  }
+
+  const ROT_PATTERNS = PATTERNS.map(p => {
+    const r0 = p.levels;
+    const r1 = rotate90(r0);
+    const r2 = rotate90(r1);
+    const r3 = rotate90(r2);
+    return {
+      id: p.id,
+      url: p.url,
+      targets: [levelsToTargetVec(r0), levelsToTargetVec(r1), levelsToTargetVec(r2), levelsToTargetVec(r3)]
+    };
+  });
 
   const statusEl = document.getElementById("status");
   const video = document.getElementById("video");
   const canvas = document.getElementById("canvas");
   const btnStart = document.getElementById("start");
   const btnStop  = document.getElementById("stop");
+
+  // iOS에서 비디오 왜곡 완화
+  video.style.objectFit = "cover";
 
   let stream = null;
   let timer = null;
@@ -121,12 +134,8 @@
   function setStatus(msg) { statusEl.textContent = msg; }
 
   function rgbToGray(r, g, b) {
-    return Math.round(0.299*r + 0.587*g + 0.114*b);
+    return 0.299*r + 0.587*g + 0.114*b;
   }
-
-  // (추가 권장) iOS에서 비디오가 늘어나는 케이스 완화
-  // CSS에 넣어도 되지만, 여기서도 안전하게 설정
-  video.style.objectFit = "cover";
 
   // ROI를 100x100으로 캡처 (직사각형 ROI 허용)
   function captureROITo100(cx, cy, sw, sh) {
@@ -144,7 +153,7 @@
     return ctx.getImageData(0, 0, 100, 100);
   }
 
-  // 셀 트림 평균
+  // 셀 트림 평균(블러/모아레/노이즈 완화)
   function cellTrimmedMean(imageData, r0, c0, cellSize) {
     const { data } = imageData;
     const vals = [];
@@ -159,52 +168,78 @@
     const slice = vals.slice(cut, vals.length - cut);
     let sum = 0;
     for (const v of slice) sum += v;
-    return Math.round(sum / slice.length);
+    return sum / slice.length;
   }
 
-  function extractLevels(imageData) {
+  // ROI -> 10x10 연속 회색 벡터(0..255)
+  function extractGrayVec(imageData) {
     const cell = 10;
-    const levels = Array.from({length:N}, () => Array(N).fill(0));
-    const hist = [0,0,0,0];
-
+    const v = new Float32Array(N*N);
+    let k = 0;
     for (let r=0;r<N;r++) {
       for (let c=0;c<N;c++) {
-        const g = cellTrimmedMean(imageData, r*cell, c*cell, cell);
-        const lv = quantize(g);
-        levels[r][c] = lv;
-        hist[lv]++;
+        v[k++] = cellTrimmedMean(imageData, r*cell, c*cell, cell);
       }
     }
-    return { levels, hist };
+    return v;
   }
 
-  function mismatchCount(a, b) {
-    let m = 0;
-    for (let r=0;r<N;r++) for (let c=0;c<N;c++) if (a[r][c] !== b[r][c]) m++;
-    return m;
+  // 관측 obs를 a*obs+b로 보정해서 target에 맞춘 뒤 RMSE 계산
+  // (자동노출/밝기 변화/감마 영향에 강해짐)
+  function rmseWithAffineFit(obs, target) {
+    const n = obs.length;
+
+    let meanO = 0, meanT = 0;
+    for (let i=0;i<n;i++) { meanO += obs[i]; meanT += target[i]; }
+    meanO /= n; meanT /= n;
+
+    let varO = 0, covOT = 0;
+    for (let i=0;i<n;i++) {
+      const xo = obs[i] - meanO;
+      const yt = target[i] - meanT;
+      varO += xo*xo;
+      covOT += xo*yt;
+    }
+    if (varO < 1e-6) return Infinity;
+
+    let a = covOT / varO;
+    // 템플릿이 반전되는 것(음수 기울기)은 제외
+    if (a < 0) return Infinity;
+
+    const b = meanT - a*meanO;
+
+    let mse = 0;
+    for (let i=0;i<n;i++) {
+      const diff = (a*obs[i] + b) - target[i];
+      mse += diff*diff;
+    }
+    mse /= n;
+    return Math.sqrt(mse);
   }
 
-  // 오검출 방지용 간단 필터
-  function passesHistogramFilter(hist) {
-    const total = hist[0]+hist[1]+hist[2]+hist[3];
-    if (total !== 100) return false;
-    const maxBin = Math.max(...hist);
-    if (maxBin >= 92) return false;
-    const nonZeroBins = hist.filter(x => x > 0).length;
-    if (nonZeroBins < 2) return false;
-    return true;
+  // 너무 단색인 ROI 빠르게 제외(가벼운 가드)
+  function passesContrastGate(obs) {
+    // 표준편차가 너무 작으면(거의 단색) 제외
+    const n = obs.length;
+    let mean = 0;
+    for (let i=0;i<n;i++) mean += obs[i];
+    mean /= n;
+    let v = 0;
+    for (let i=0;i<n;i++) { const d = obs[i]-mean; v += d*d; }
+    v /= n;
+    const std = Math.sqrt(v);
+    return std >= 18; // 너무 낮으면 배경일 확률 큼
   }
 
-  // 한 프레임에서 “가장 잘 맞는 패턴” 찾기
   function scanFrameOnce() {
     const w = video.videoWidth, h = video.videoHeight;
-    if (!w || !h) return { best: 999, ok:false, bestId:null, bestUrl:null };
+    if (!w || !h) return { best: Infinity, ok:false, bestId:null, bestUrl:null };
 
     const baseSide = Math.min(w, h);
     const centerX = w / 2;
     const centerY = h / 2;
 
-    let bestMismatch = 999;
+    let best = Infinity;
     let bestId = null;
     let bestUrl = null;
 
@@ -223,19 +258,20 @@
             const imgData = captureROITo100(cx, cy, sw, sh);
             if (!imgData) continue;
 
-            const { levels, hist } = extractLevels(imgData);
-            if (!passesHistogramFilter(hist)) continue;
+            const obs = extractGrayVec(imgData);
+            if (!passesContrastGate(obs)) continue;
 
             for (const p of ROT_PATTERNS) {
-              for (const t of p.rots) {
-                const mm = mismatchCount(levels, t);
-                if (mm < bestMismatch) {
-                  bestMismatch = mm;
+              for (const t of p.targets) {
+                const s = rmseWithAffineFit(obs, t);
+                if (s < best) {
+                  best = s;
                   bestId = p.id;
                   bestUrl = p.url;
                 }
-                if (bestMismatch <= MAX_MISMATCH) {
-                  return { best: bestMismatch, ok:true, bestId, bestUrl };
+                // 충분히 좋아지면 조기 종료
+                if (best <= RMSE_THRESHOLD) {
+                  return { best, ok:true, bestId, bestUrl };
                 }
               }
             }
@@ -244,7 +280,7 @@
       }
     }
 
-    return { best: bestMismatch, ok: bestMismatch <= MAX_MISMATCH, bestId, bestUrl };
+    return { best, ok: best <= RMSE_THRESHOLD, bestId, bestUrl };
   }
 
   function loop() {
@@ -254,8 +290,9 @@
     if (res.ok) okStreak++;
     else okStreak = Math.max(0, okStreak - 1);
 
-    setStatus(`스캔 중… best mismatch=${res.best}, match=${res.bestId ?? "-"}, streak=${okStreak}`);
+    setStatus(`스캔 중… score(RMSE)=${res.best.toFixed(1)}, match=${res.bestId ?? "-"}, streak=${okStreak}`);
 
+    // QR처럼 “딱 잡히면” 바로 이동: 2프레임 연속만 만족하면 이동
     if (okStreak >= 2 && res.bestUrl) {
       opened = true;
       setStatus(`인식 성공(${res.bestId})! 이동합니다…`);
@@ -305,6 +342,7 @@
   }
 })();
 </script>
+
 
 
 </body>
